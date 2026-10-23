@@ -3,20 +3,91 @@ const config = require("./config");
 const logger = require("./logger");
 
 /**
- * Creates and returns the nodemailer transporter using configured credentials
+ * Transporter Cache (Outside Request Handler Scope)
+ *
+ * Persists cached Nodemailer transporter instances across warm serverless invocations
+ * (e.g., Vercel, Netlify, AWS Lambda) and Express server lifecycles.
+ * Reusing SMTP connections saves up to 1000ms per email by avoiding redundant handshakes.
  */
-function getTransporter() {
-  if (!config.emailUser || !config.emailPassword) {
+const transporterCache = new Map();
+
+/**
+ * Creates or retrieves a cached Nodemailer transporter instance.
+ * Enables connection pooling across warm invocations.
+ *
+ * @param {Object} [account] - { user, pass }
+ * @returns {nodemailer.Transporter}
+ */
+function getTransporter(account) {
+  const currentAccount = account || config.accounts[0] || {
+    user: config.emailUser,
+    pass: config.emailPassword,
+  };
+
+  if (!currentAccount.user || !currentAccount.pass) {
     logger.warn("EMAIL_USER or EMAIL_PASSWORD is not set in environment variables.");
   }
 
-  return nodemailer.createTransport({
-    service: config.emailService,
+  const service = config.emailService || "gmail";
+  const cacheKey = `${service}:${currentAccount.user}`;
+
+  if (transporterCache.has(cacheKey)) {
+    return transporterCache.get(cacheKey);
+  }
+
+  logger.info(
+    `[Transporter Cache] Creating and caching pooled transporter for ${currentAccount.user} (service: ${service})`
+  );
+
+  const transporter = nodemailer.createTransport({
+    service,
+    pool: true, // Reuse pooled SMTP connections across warm invocations
+    maxConnections: 3,
+    maxMessages: 100,
     auth: {
-      user: config.emailUser,
-      pass: config.emailPassword,
+      user: currentAccount.user,
+      pass: currentAccount.pass,
     },
   });
+
+  transporterCache.set(cacheKey, transporter);
+  return transporter;
+}
+
+/**
+ * Clears cached transporter instances (for testing or credential invalidation)
+ */
+function clearTransporterCache(user) {
+  if (user) {
+    const service = config.emailService || "gmail";
+    const cacheKey = `${service}:${user}`;
+    const transporter = transporterCache.get(cacheKey);
+    if (transporter && typeof transporter.close === "function") {
+      try {
+        transporter.close();
+      } catch (_) {}
+    }
+    transporterCache.delete(cacheKey);
+  } else {
+    for (const transporter of transporterCache.values()) {
+      if (transporter && typeof transporter.close === "function") {
+        try {
+          transporter.close();
+        } catch (_) {}
+      }
+    }
+    transporterCache.clear();
+  }
+}
+
+/**
+ * Returns cache telemetry stats for monitoring and health reporting
+ */
+function getTransporterCacheStats() {
+  return {
+    cachedCount: transporterCache.size,
+    cachedAccounts: Array.from(transporterCache.keys()),
+  };
 }
 
 /**
@@ -109,21 +180,23 @@ function escapeHtml(str) {
 }
 
 /**
- * Resolves the "from" header based on custom from, fromName, or environment default
+ * Resolves the "from" header based on custom from, fromName, and the active authenticated account
  */
-function resolveFromAddress({ from, fromName }) {
+function resolveFromAddress({ from, fromName }, activeUser) {
   if (from) {
     return from;
   }
-  if (fromName) {
-    const userEmail = config.emailUser || "noreply@mailsync.com";
-    return `"${fromName.trim()}" <${userEmail}>`;
-  }
-  return config.emailFrom;
+  const userEmail = activeUser || config.emailUser || "noreply@mailsync.com";
+  const senderName = fromName ? fromName.trim() : config.fromName;
+  return `"${senderName}" <${userEmail}>`;
 }
 
 /**
- * Sends an email using Nodemailer
+ * Sends an email using Nodemailer with dynamic multi-account failover
+ *
+ * If the primary account encounters a rate limit (HTTP 421, SMTP 452/535) or network failure,
+ * MailSync immediately retries with the next fallback account in the same request.
+ *
  * @param {Object} options
  * @param {string} options.email - Target recipient email
  * @param {string} [options.to] - Target recipient email (alias for email)
@@ -140,8 +213,12 @@ async function sendMail({ email, to, name, fromName, from, subject, message, htm
     throw new Error("Recipient email is required ('email' or 'to')");
   }
 
+  const accounts = config.getAccounts();
+  if (accounts.length === 0) {
+    accounts.push({ user: config.emailUser, pass: config.emailPassword });
+  }
+
   const finalSubject = subject || "New Notification from MailSync";
-  const finalFrom = resolveFromAddress({ from, fromName });
 
   // Prepare HTML with watermark
   let finalHtml = "";
@@ -155,31 +232,105 @@ async function sendMail({ email, to, name, fromName, from, subject, message, htm
   const textWatermark = "\n\n---\n Powered by MailSync • Open Source Email Project";
   const finalText = (message || "") + textWatermark;
 
-  const mailOptions = {
-    from: finalFrom,
-    to: recipient,
-    subject: finalSubject,
-    text: finalText,
-    html: finalHtml,
-  };
+  const errors = [];
 
-  const transporter = getTransporter();
-  const info = await transporter.sendMail(mailOptions);
-  return info;
+  for (let attempt = 0; attempt < accounts.length; attempt++) {
+    const currentAccount = accounts[attempt];
+    const finalFrom = resolveFromAddress({ from, fromName }, currentAccount.user);
+
+    const mailOptions = {
+      from: finalFrom,
+      to: recipient,
+      subject: finalSubject,
+      text: finalText,
+      html: finalHtml,
+    };
+
+    try {
+      const transporter = getTransporter(currentAccount);
+      const info = await transporter.sendMail(mailOptions);
+
+      if (attempt > 0) {
+        logger.warn(
+          `[Failover Success] Email sent to ${recipient} via fallback account [${currentAccount.user}] on attempt ${attempt + 1}/${accounts.length}.`
+        );
+      } else {
+        logger.info(`Email successfully sent to ${recipient} via [${currentAccount.user}] (Message ID: ${info.messageId})`);
+      }
+
+      return {
+        ...info,
+        sentVia: currentAccount.user,
+        attempt: attempt + 1,
+        totalAccounts: accounts.length,
+      };
+    } catch (error) {
+      const errorCode = error.responseCode || error.code || "UNKNOWN";
+      const errorDetail = `[Account ${attempt + 1}/${accounts.length}: ${currentAccount.user}] Code ${errorCode}: ${error.message}`;
+      errors.push(errorDetail);
+
+      const hasNextAccount = attempt + 1 < accounts.length;
+      logger.warn(
+        `[Failover] Account [${currentAccount.user}] failed for ${recipient}: ${error.message} (code: ${errorCode}). ${
+          hasNextAccount
+            ? `Retrying with next account [${accounts[attempt + 1].user}]...`
+            : "All fallback accounts exhausted."
+        }`
+      );
+
+      // Invalidate cached transporter on credential or network disconnection errors
+      if (error.responseCode === 535 || error.code === "ECONNRESET" || error.code === "ETIMEDOUT") {
+        clearTransporterCache(currentAccount.user);
+      }
+    }
+  }
+
+  const aggregatedMessage = `Failed to send email to ${recipient} after trying ${accounts.length} account(s):\n${errors.join("\n")}`;
+  logger.error(aggregatedMessage);
+  const failureError = new Error(aggregatedMessage);
+  failureError.attempts = accounts.length;
+  failureError.details = errors;
+  throw failureError;
 }
 
 /**
- * Verifies Nodemailer transporter connection
+ * Verifies Nodemailer transporter connections across all configured accounts
  */
 async function verifyTransporter() {
-  const transporter = getTransporter();
-  return await transporter.verify();
+  const accounts = config.getAccounts();
+  if (accounts.length === 0) {
+    const transporter = getTransporter();
+    return await transporter.verify();
+  }
+
+  const results = [];
+  const errors = [];
+
+  for (const account of accounts) {
+    try {
+      const transporter = getTransporter(account);
+      await transporter.verify();
+      results.push({ account: account.user, status: "verified" });
+    } catch (err) {
+      errors.push({ account: account.user, error: err.message });
+    }
+  }
+
+  if (results.length === 0 && errors.length > 0) {
+    throw new Error(
+      `All accounts failed verification: ${errors.map((e) => `${e.account}: ${e.error}`).join("; ")}`
+    );
+  }
+
+  return { verified: results, failed: errors, total: accounts.length };
 }
 
 module.exports = {
   sendMail,
   verifyTransporter,
   getTransporter,
+  clearTransporterCache,
+  getTransporterCacheStats,
   resolveFromAddress,
   injectWatermark,
 };

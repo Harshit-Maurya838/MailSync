@@ -48,10 +48,11 @@ app.get(["/logs", "/api/logs"], (req, res) => {
 // SMTP Connection Verification endpoint
 app.get("/api/verify", async (req, res) => {
   try {
-    await verifyTransporter();
+    const verification = await verifyTransporter();
     res.status(200).json({
       success: true,
       message: "Transporter verified successfully. Ready to send emails.",
+      verification,
     });
   } catch (error) {
     logger.error(`Transporter verification failed: ${error.message}`);
@@ -104,20 +105,21 @@ const handleSendMail = async (req, res) => {
       html,
     });
 
-    logger.info(`Email successfully sent to ${recipient} (Message ID: ${info.messageId})`);
-
     res.status(200).json({
       success: true,
       message: "Email sent successfully",
       messageId: info.messageId,
       recipient,
+      sentVia: info.sentVia,
+      attempt: info.attempt,
+      totalAccounts: info.totalAccounts,
     });
   } catch (error) {
     logger.error(`Error sending email to ${recipient}: ${error.message}`);
     res.status(500).json({
       success: false,
       error: "Failed to send email",
-      details: error.message,
+      details: error.details || error.message,
     });
   }
 };

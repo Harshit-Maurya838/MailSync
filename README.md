@@ -18,6 +18,8 @@ Stop paying for expensive third-party email delivery services for simple contact
 
 - **Single Clean Endpoint**: Send transactional emails with a simple `POST /mail` (or `POST /api/mail`).
 - **Zero Config Serverless**: Pre-configured for seamless 1-click deployments on **Vercel** and **Netlify**.
+- **Multi-Account Dynamic Failover ("Zero-DB List Rotation")**: Pass comma-separated accounts (`EMAIL_USER="m1@gmail.com,m2@gmail.com"`). If primary hits rate limits (SMTP 421/452/535), MailSync instantly fails over to backup credentials in the same request.
+- **Transporter Caching & Re-use**: SMTP connection pools are cached in module scope across warm serverless invocations, eliminating redundant TLS/auth handshakes and shaving up to 1 second per email.
 - **Works with Gmail & Any Provider**: Built-in support for Gmail App Passwords, SendGrid, Mailgun, or custom SMTP servers.
 - **Built-in HTML Email Formatting**: Raw text messages are automatically wrapped into clean, modern, mobile-responsive HTML templates. Custom HTML is also fully supported.
 - **Optional API Key Security**: Protect your endpoint with an `x-access-key` header, or leave it open for public contact forms.
@@ -240,13 +242,24 @@ See [INTEGRATION_PROMPT.md](INTEGRATION_PROMPT.md) for full documentation and fr
 
 | Variable | Default | Description |
 |---|---|---|
-| `EMAIL_USER` | *None* | Email address used for authentication (e.g. Gmail) |
-| `EMAIL_PASSWORD` | *None* | Email password or Google App Password |
+| `EMAIL_USER` | *None* | Primary email or comma-separated list for failover (`user1@gmail.com,user2@gmail.com`) |
+| `EMAIL_PASSWORD` | *None* | Primary password or comma-separated list (`pass1,pass2`) |
 | `FROM_NAME` | `"MailSync"` | Default sender/from name (e.g. `"MyBrand"`, `"Acme Support"`) |
 | `EMAIL_SERVICE` | `gmail` | Nodemailer service provider (`gmail`, `sendgrid`, `mailgun`, etc.) |
 | `EMAIL_FROM` | `"${FROM_NAME}" <EMAIL_USER>` | Full custom sender header (overrides `FROM_NAME`) |
 | `ACCESS_KEY` | *None* | Secret key required to send emails. If empty, the endpoint is public. |
 | `PORT` | `5000` | Port for the standalone Node.js server |
+
+### 🔄 Multi-Account Dynamic Failover (Zero-DB Rotation)
+To protect against Gmail daily limits (500 mails/day on free accounts) or provider rate-limiting, provide comma-separated credentials:
+```env
+EMAIL_USER="primary@gmail.com,backup1@gmail.com,backup2@gmail.com"
+EMAIL_PASSWORD="app-pass-1,app-pass-2,app-pass-3"
+```
+When MailSync encounters a rate limit (HTTP 421 or SMTP 452/535), it automatically retries with the next account in line within the same incoming request.
+
+### ⚡ Transporter Connection Caching
+Transporters are pooled and cached at module scope outside request handlers, enabling warm Vercel/Netlify/Lambda container re-use without re-establishing TCP/TLS handshakes on every invocation.
 
 ---
 

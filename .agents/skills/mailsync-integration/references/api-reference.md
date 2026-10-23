@@ -40,7 +40,10 @@ Sends a transactional email.
   "success": true,
   "message": "Email sent successfully",
   "messageId": "<b6589fc6-8e12-7dc2-359a-20a52cfa4323@gmail.com>",
-  "recipient": "user@example.com"
+  "recipient": "user@example.com",
+  "sentVia": "primary@gmail.com",
+  "attempt": 1,
+  "totalAccounts": 2
 }
 ```
 
